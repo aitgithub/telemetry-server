@@ -56,6 +56,43 @@ def compress_and_delete(tmp_name, basename):
     os.rename(comp_log_name, comp_name)
     #print "Finished compressing", basename, "as", comp_name
 
+from contextlib import contextmanager
+@contextmanager
+def file_lock(filename):
+    lock = filename + ".lock"
+    print "Locking", lock
+    try:
+        # open it with O_CREAT|O_EXCL, preferably blocking
+        print "opening lock"
+        try:
+            lock_fd = os.open(lock, os.O_WRONLY|os.O_CREAT|os.O_EXCL)
+        except OSError, e:
+            if e.errno == errno.ENOENT:
+                os.makedirs(os.path.dirname(lock))
+                lock_fd = os.open(lock, os.O_WRONLY|os.O_CREAT|os.O_EXCL)
+            else:
+                raise e
+
+        try:
+            yield
+        finally:
+            # remove lock
+            print "closing lock"
+            os.close(lock_fd)
+            print "removing lock"
+            os.remove(lock)
+    except OSError, e:
+        if e.errno == errno.EEXIST:
+            print "Error obtaining lock"
+            raise LockError(lock)
+        else:
+            raise e
+
+
+class LockError(OSError):
+    def __init__(self, filename):
+        self.filename = filename
+
 
 class StorageLayout:
     """A class for encapsulating the on-disk data layout for Telemetry"""
@@ -92,25 +129,38 @@ class StorageLayout:
         # We want to roll this over (and compress) when it reaches a size limit
         # The compressed log filenames will be something like
         #   a.b.c.log.3.gz
-        try:
-            fout = open(filename, "a")
-        except IOError:
-            os.makedirs(os.path.dirname(filename))
-            fout = open(filename, "a")
+        written = False
+        while not written:
+            try:
+                with file_lock(filename):
+                    try:
+                        fout = open(filename, "a")
+                    except IOError:
+                        os.makedirs(os.path.dirname(filename))
+                        fout = open(filename, "a")
 
-        # TODO: should we actually write "err" to file?
-        fout.write(uuid)
-        fout.write("\t")
-        if isinstance(obj, basestring):
-            fout.write(self.clean_newlines(obj, uuid))
-        else:
-            # Use minimal json (without excess spaces)
-            fout.write(json.dumps(obj, separators=(',', ':')))
-        fout.write("\n")
+                    # TODO: should we actually write "err" to file?
+                    fout.write(uuid)
+                    fout.write("\t")
+                    if isinstance(obj, basestring):
+                        fout.write(self.clean_newlines(obj, uuid))
+                    else:
+                        # Use minimal json (without excess spaces)
+                        fout.write(json.dumps(obj, separators=(',', ':')))
+                    fout.write("\n")
 
-        filesize = fout.tell()
-        print "Wrote to", filename, "new size is", filesize
-        fout.close()
+                    filesize = fout.tell()
+                    print "Wrote to", filename, "new size is", filesize
+                    fout.close()
+                    written = True
+            except LockError, e:
+                # Use a custom error class so that we don't accidentally catch
+                # some unrelated exception and get stuck here forever.
+                print "Failed to lock", filename, ":", e.filename
+                # TODO: increment metrics for lock fails
+                # sleep 100ms
+                time.sleep(0.1)
+
         if filesize >= self._max_log_size:
             self.rotate(filename)
 
